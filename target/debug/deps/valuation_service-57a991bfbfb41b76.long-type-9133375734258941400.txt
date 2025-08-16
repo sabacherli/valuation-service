@@ -1,0 +1,2 @@
+impl std::future::Future<Output = Result<PortfolioValuation, ValuationError>>
+impl std::future::Future<Output = Result<Json<SimpleResponse>, axum::http::StatusCode>>

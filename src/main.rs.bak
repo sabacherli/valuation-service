@@ -1,0 +1,284 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower::ServiceBuilder;
+use tower_http::cors::CorsLayer;
+use tracing::{info, warn};
+use tracing_subscriber;
+
+use valuation_service::{
+    instruments::{FinancialOption, OptionType, ExerciseStyle, Stock, Bond, PaymentFrequency},
+    market_data::{MockMarketDataProvider, MarketDataProvider},
+    models::{BlackScholesModel, MonteCarloModel},
+    portfolio::{Portfolio, PortfolioValuationService},
+    risk::RiskEngine,
+    valuation::{Instrument, MarketContext, ValuationRequest, ValuationResponse, Valuator},
+    Result, ValuationError,
+};
+
+#[derive(Clone)]
+struct AppState {
+    portfolios: Arc<RwLock<HashMap<String, Portfolio>>>,
+    instruments: Arc<RwLock<HashMap<String, Box<dyn Instrument + Send + Sync>>>>,
+    market_data_provider: Arc<MockMarketDataProvider>,
+    portfolio_service: Arc<PortfolioValuationService>,
+    black_scholes_model: Arc<BlackScholesModel>,
+    monte_carlo_model: Arc<MonteCarloModel>,
+}
+
+#[derive(Deserialize)]
+struct CreatePortfolioRequest {
+    name: String,
+    base_currency: String,
+}
+
+#[derive(Deserialize)]
+struct AddPositionRequest {
+    instrument_id: String,
+    quantity: f64,
+    average_cost: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct CreateStockRequest {
+    symbol: String,
+    currency: String,
+    shares: f64,
+    price: f64,
+    volatility: f64,
+    dividend_yield: f64,
+}
+
+#[derive(Deserialize)]
+struct CreateOptionRequest {
+    underlying: String,
+    currency: String,
+    option_type: String, // "call" or "put"
+    strike: f64,
+    expiry: String, // ISO 8601 format
+    quantity: f64,
+    exercise_style: String, // "european", "american", "bermudan"
+}
+
+// Simplified for now - can be extended later
+// #[derive(Deserialize)]
+// struct ValuationQuery {
+//     model: Option<String>,
+//     include_greeks: Option<bool>,
+//     include_risk_metrics: Option<bool>,
+// }
+
+async fn create_portfolio(
+    State(state): State<AppState>,
+    Json(request): Json<CreatePortfolioRequest>,
+) -> Result<Json<Portfolio>, StatusCode> {
+    let portfolio = Portfolio::new(request.name, request.base_currency);
+    let portfolio_id = portfolio.id.clone();
+    
+    state.portfolios.write().await.insert(portfolio_id, portfolio.clone());
+    
+    info!("Created portfolio: {}", portfolio.id);
+    Ok(Json(portfolio))
+}
+
+async fn get_portfolio(
+    State(state): State<AppState>,
+    Path(portfolio_id): Path<String>,
+) -> Result<Json<Portfolio>, StatusCode> {
+    let portfolios = state.portfolios.read().await;
+    let portfolio = portfolios.get(&portfolio_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    
+    Ok(Json(portfolio.clone()))
+}
+
+async fn add_position(
+    State(state): State<AppState>,
+    Path(portfolio_id): Path<String>,
+    Json(request): Json<AddPositionRequest>,
+) -> Result<Json<String>, StatusCode> {
+    let mut portfolios = state.portfolios.write().await;
+    let portfolio = portfolios.get_mut(&portfolio_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    
+    // Check if instrument exists
+    let instruments = state.instruments.read().await;
+    if !instruments.contains_key(&request.instrument_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    
+    let position_id = portfolio.add_position(
+        request.instrument_id,
+        request.quantity,
+        request.average_cost,
+    );
+    
+    info!("Added position {} to portfolio {}", position_id, portfolio_id);
+    Ok(Json(position_id))
+}
+
+async fn create_stock(
+    State(state): State<AppState>,
+    Json(request): Json<CreateStockRequest>,
+) -> Result<Json<String>, StatusCode> {
+    let stock = Stock::new(request.symbol.clone(), request.currency, request.shares);
+    let instrument_id = stock.id().to_string();
+    
+    // Note: In a real implementation, you would update the market data provider
+    // For now, we'll skip this step since MockMarketDataProvider doesn't support mutation
+    
+    // Store instrument
+    state.instruments.write().await.insert(
+        instrument_id.clone(),
+        Box::new(stock),
+    );
+    
+    info!("Created stock instrument: {}", instrument_id);
+    Ok(Json(instrument_id))
+}
+
+async fn create_option(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOptionRequest>,
+) -> Result<Json<String>, StatusCode> {
+    let option_type = match request.option_type.to_lowercase().as_str() {
+        "call" => OptionType::Call,
+        "put" => OptionType::Put,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    
+    let exercise_style = match request.exercise_style.to_lowercase().as_str() {
+        "european" => ExerciseStyle::European,
+        "american" => ExerciseStyle::American,
+        "bermudan" => ExerciseStyle::Bermudan,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    
+    let expiry = chrono::DateTime::parse_from_rfc3339(&request.expiry)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .with_timezone(&chrono::Utc);
+    
+    let option = FinancialOption::new(
+        request.underlying,
+        request.currency,
+        option_type,
+        request.strike,
+        expiry,
+        request.quantity,
+        exercise_style,
+    );
+    
+    let instrument_id = option.id().to_string();
+    
+    state.instruments.write().await.insert(
+        instrument_id.clone(),
+        Box::new(option),
+    );
+    
+    info!("Created option instrument: {}", instrument_id);
+    Ok(Json(instrument_id))
+}
+
+async fn value_portfolio(
+    State(state): State<AppState>,
+    Path(portfolio_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let portfolios = state.portfolios.read().await;
+    let portfolio = portfolios.get(&portfolio_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    
+    let instruments = state.instruments.read().await;
+    
+    // Use Black-Scholes model by default
+    let valuator: &dyn Valuator = state.black_scholes_model.as_ref();
+    
+    // Get market context (simplified - using first instrument's symbol)
+    let market_context = if let Some(position) = portfolio.positions.first() {
+        if let Some(instrument) = instruments.get(&position.instrument_id) {
+            // For demo purposes, use a generic symbol
+            state.market_data_provider.get_market_context("AAPL").await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        } else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    
+    let instruments_deref = &*instruments;
+    let valuation = state.portfolio_service.value_portfolio(
+        portfolio,
+        instruments_deref,
+        valuator,
+        &market_context,
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(serde_json::to_value(valuation).unwrap()))
+}
+
+async fn get_market_data(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let context = state.market_data_provider.get_market_context(&symbol).await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    Ok(Json(serde_json::to_value(context).unwrap()))
+}
+
+async fn health_check() -> &'static str {
+    "Valuation Service is healthy"
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+    
+    // Initialize services
+    let market_data_provider = Arc::new(MockMarketDataProvider::new());
+    let risk_engine = RiskEngine::new(0.95, 1, 10000);
+    let portfolio_service = Arc::new(PortfolioValuationService::new(risk_engine));
+    let black_scholes_model = Arc::new(BlackScholesModel::new());
+    let monte_carlo_model = Arc::new(MonteCarloModel::new(10000, 252));
+    
+    let state = AppState {
+        portfolios: Arc::new(RwLock::new(HashMap::new())),
+        instruments: Arc::new(RwLock::new(HashMap::new())),
+        market_data_provider,
+        portfolio_service,
+        black_scholes_model,
+        monte_carlo_model,
+    };
+    
+    // Build the router
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/portfolios", post(create_portfolio))
+        .route("/portfolios/:id", get(get_portfolio))
+        .route("/portfolios/:id/positions", post(add_position))
+        .route("/portfolios/:id/valuation", get(value_portfolio))
+        .route("/instruments/stocks", post(create_stock))
+        .route("/instruments/options", post(create_option))
+        .route("/market-data/:symbol", get(get_market_data))
+        .layer(
+            ServiceBuilder::new()
+                .layer(CorsLayer::permissive())
+        )
+        .with_state(state);
+    
+    info!("Starting Valuation Service on port 3000");
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    
+    Ok(())
+}

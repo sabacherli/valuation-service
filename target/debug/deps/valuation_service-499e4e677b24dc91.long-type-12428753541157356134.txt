@@ -1,0 +1,1 @@
+fn(axum::extract::State<AppState>, axum::extract::Path<std::string::String>, axum::Json<AddPositionRequest>) -> impl std::future::Future<Output = Result<axum::Json<std::string::String>, ValuationError>> {add_position}
