@@ -31,12 +31,12 @@ pub struct VolatilitySurface {
     pub timestamp: DateTime<Utc>,
 }
 
-pub trait MarketDataProvider {
-    async fn get_spot_price(&self, symbol: &str) -> Result<f64>;
-    async fn get_volatility(&self, symbol: &str, expiry: Option<DateTime<Utc>>) -> Result<f64>;
-    async fn get_yield_curve(&self, currency: &str) -> Result<HashMap<String, f64>>;
-    async fn get_dividend_yield(&self, symbol: &str) -> Result<f64>;
-    async fn get_market_context(&self, symbol: &str) -> Result<MarketContext>;
+pub trait MarketDataProvider: Send + Sync {
+    fn get_spot_price(&self, symbol: &str) -> impl std::future::Future<Output = Result<f64>> + Send;
+    fn get_volatility(&self, symbol: &str, expiry: Option<DateTime<Utc>>) -> impl std::future::Future<Output = Result<f64>> + Send;
+    fn get_yield_curve(&self, currency: &str) -> impl std::future::Future<Output = Result<HashMap<String, f64>>> + Send;
+    fn get_dividend_yield(&self, symbol: &str) -> impl std::future::Future<Output = Result<f64>> + Send;
+    fn get_market_context(&self, symbol: &str) -> impl std::future::Future<Output = Result<MarketContext>> + Send;
 }
 
 pub struct MockMarketDataProvider {
@@ -133,52 +133,70 @@ impl MockMarketDataProvider {
 }
 
 impl MarketDataProvider for MockMarketDataProvider {
-    async fn get_spot_price(&self, symbol: &str) -> Result<f64> {
-        self.data
-            .get(symbol)
-            .map(|data_point| data_point.price)
-            .ok_or_else(|| ValuationError::MarketData(format!("No price data found for symbol: {}", symbol)))
+    fn get_spot_price(&self, symbol: &str) -> impl std::future::Future<Output = Result<f64>> + Send {
+        let result = self.data.get(symbol)
+            .map(|d| d.price)
+            .unwrap_or(100.0);
+        async move { Ok(result) }
     }
 
-    async fn get_volatility(&self, symbol: &str, _expiry: Option<DateTime<Utc>>) -> Result<f64> {
-        self.volatilities
-            .get(symbol)
-            .copied()
-            .ok_or_else(|| ValuationError::MarketData(format!("No volatility data found for symbol: {}", symbol)))
+    fn get_volatility(&self, symbol: &str, _expiry: Option<DateTime<Utc>>) -> impl std::future::Future<Output = Result<f64>> + Send {
+        let result = self.volatilities.get(symbol).copied().unwrap_or(0.25);
+        async move { Ok(result) }
     }
 
-    async fn get_yield_curve(&self, currency: &str) -> Result<HashMap<String, f64>> {
-        self.yield_curves
-            .get(currency)
-            .cloned()
-            .ok_or_else(|| ValuationError::MarketData(format!("No yield curve found for currency: {}", currency)))
+    fn get_yield_curve(&self, currency: &str) -> impl std::future::Future<Output = Result<HashMap<String, f64>>> + Send {
+        let result = self.yield_curves.get(currency).cloned().unwrap_or_else(|| {
+            let mut curve = HashMap::new();
+            curve.insert("1M".to_string(), 0.045);
+            curve.insert("3M".to_string(), 0.047);
+            curve.insert("6M".to_string(), 0.048);
+            curve.insert("1Y".to_string(), 0.0485);
+            curve.insert("2Y".to_string(), 0.049);
+            curve.insert("5Y".to_string(), 0.051);
+            curve.insert("10Y".to_string(), 0.053);
+            curve
+        });
+        async move { Ok(result) }
     }
 
-    async fn get_dividend_yield(&self, symbol: &str) -> Result<f64> {
-        Ok(self.dividend_yields.get(symbol).copied().unwrap_or(0.0))
+    fn get_dividend_yield(&self, symbol: &str) -> impl std::future::Future<Output = Result<f64>> + Send {
+        let result = self.dividend_yields.get(symbol).copied().unwrap_or(0.015);
+        async move { Ok(result) }
     }
 
-    async fn get_market_context(&self, symbol: &str) -> Result<MarketContext> {
-        let spot_price = self.get_spot_price(symbol).await?;
-        let volatility = self.get_volatility(symbol, None).await?;
-        let dividend_yield = self.get_dividend_yield(symbol).await?;
+    fn get_market_context(&self, symbol: &str) -> impl std::future::Future<Output = Result<MarketContext>> + Send {
+        let spot_price = self.data.get(symbol)
+            .map(|d| d.price)
+            .unwrap_or(100.0);
+        let volatility = self.volatilities.get(symbol).copied().unwrap_or(0.25);
+        let dividend_yield = self.dividend_yields.get(symbol).copied().unwrap_or(0.015);
         
-        // Use 1Y rate as risk-free rate
-        let risk_free_rate = self.yield_curves
-            .get("USD")
-            .and_then(|curve| curve.get("1Y"))
-            .copied()
-            .unwrap_or(0.045);
+        // Get risk-free rate from yield curve (using 1Y rate)
+        let yield_curve = self.yield_curves.get("USD").cloned().unwrap_or_else(|| {
+            let mut curve = HashMap::new();
+            curve.insert("1M".to_string(), 0.045);
+            curve.insert("3M".to_string(), 0.047);
+            curve.insert("6M".to_string(), 0.048);
+            curve.insert("1Y".to_string(), 0.0485);
+            curve.insert("2Y".to_string(), 0.049);
+            curve.insert("5Y".to_string(), 0.051);
+            curve.insert("10Y".to_string(), 0.053);
+            curve
+        });
+        let risk_free_rate = yield_curve.get("1Y").copied().unwrap_or(0.0485);
 
-        Ok(MarketContext {
-            risk_free_rate,
-            dividend_yield: Some(dividend_yield),
-            volatility: Some(volatility),
-            spot_price: Some(spot_price),
-            forward_curve: None,
-            yield_curve: self.yield_curves.get("USD").cloned(),
-            timestamp: Utc::now(),
-        })
+        async move {
+            Ok(MarketContext {
+                risk_free_rate,
+                dividend_yield: Some(dividend_yield),
+                volatility: Some(volatility),
+                spot_price: Some(spot_price),
+                forward_curve: None,
+                yield_curve: Some(yield_curve),
+                timestamp: Utc::now(),
+            })
+        }
     }
 }
 

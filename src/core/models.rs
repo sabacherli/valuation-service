@@ -75,7 +75,7 @@ impl BlackScholesModel {
 
         let normal = Normal::new(0.0, 1.0).map_err(|e| ValuationError::PricingModel(e.to_string()))?;
         let phi_d1 = normal.pdf(d1);
-        let phi_d2 = normal.pdf(d2);
+        let _phi_d2 = normal.pdf(d2);
         let n_d1 = normal.cdf(d1);
         let n_d2 = normal.cdf(d2);
 

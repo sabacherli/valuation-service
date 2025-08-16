@@ -14,12 +14,9 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use valuation_service::{
-    instruments::Stock,
-    market_data::{MockMarketDataProvider, MarketDataProvider},
-    models::BlackScholesModel,
-    portfolio::{Portfolio, PortfolioValuationService},
-    risk::RiskEngine,
-    valuation::Instrument,
+    Stock, BlackScholesModel, Instrument,
+    MockMarketDataProvider, MarketDataProvider, 
+    Portfolio, PortfolioValuationService, RiskEngine,
 };
 
 // Simplified request/response types
@@ -30,6 +27,7 @@ struct CreatePortfolioRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AddPositionRequest {
     instrument_id: String,
     quantity: f64,
