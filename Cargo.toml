@@ -25,6 +25,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 axum = { version = "0.7", features = ["macros"] }
 tokio-stream = "0.1"
+async-stream = "0.3"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors"] }
 nalgebra = "0.32"

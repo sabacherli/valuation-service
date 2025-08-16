@@ -1,15 +1,15 @@
 use axum::{
-    extract::Query,
-    http::{StatusCode, header, HeaderMap, HeaderValue},
-    response::{Json, Response},
-    routing::get,
+    extract::{Query, State},
+    http::{StatusCode, header},
+    response::{Response, Json},
+    routing::{get, post},
     Router,
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::time::{interval, Duration as TokioDuration};
-use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use valuation_service::{
@@ -18,10 +18,10 @@ use valuation_service::{
     models::BlackScholesModel,
     portfolio::{Portfolio, PortfolioValuationService},
     risk::RiskEngine,
-    valuation::{Instrument, Valuator},
+    valuation::{Instrument, InstrumentType, Valuator},
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PortfolioResponse {
     total_value: f64,
     total_pnl: f64,
@@ -34,7 +34,7 @@ struct PortfolioResponse {
     exposures: ExposuresResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PositionResponse {
     instrument_id: String,
     instrument_type: String,
@@ -50,7 +50,7 @@ struct PositionResponse {
     rho: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct GreeksResponse {
     total_delta: f64,
     total_gamma: f64,
@@ -59,7 +59,7 @@ struct GreeksResponse {
     total_rho: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ExposuresResponse {
     by_instrument_type: HashMap<String, f64>,
     by_underlying: HashMap<String, f64>,
@@ -73,7 +73,12 @@ struct PortfolioQuery {
     include_risk: bool,
 }
 
-async fn get_portfolio_data(Query(params): Query<PortfolioQuery>) -> Result<Json<PortfolioResponse>, StatusCode> {
+async fn get_portfolio_data(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Query(params): Query<PortfolioQuery>
+) -> Result<Json<PortfolioResponse>, StatusCode> {
+    println!("📊 Portfolio data requested with params: {:?}", params);
+    
     // Initialize services
     let market_data = MockMarketDataProvider::new();
     let black_scholes = BlackScholesModel::new();
@@ -222,20 +227,45 @@ async fn get_portfolio_data(Query(params): Query<PortfolioQuery>) -> Result<Json
         },
     };
     
+    // Cache the data and broadcast to SSE clients if data has changed
+    {
+        let mut cached_data = state.portfolio_data.write().await;
+        let should_broadcast = match cached_data.as_ref() {
+            Some(existing) => {
+                // Compare key fields to detect changes
+                existing.total_value != response.total_value ||
+                existing.total_pnl != response.total_pnl ||
+                existing.positions.len() != response.positions.len()
+            }
+            None => true, // First time, always broadcast
+        };
+        
+        if should_broadcast {
+            *cached_data = Some(response.clone());
+            // Broadcast to SSE clients only when data changes
+            let _ = state.tx.send(response.clone());
+        }
+    }
+    
     Ok(Json(response))
 }
 
-async fn portfolio_stream() -> Response {
-    let stream = IntervalStream::new(interval(TokioDuration::from_secs(5)))
-        .then(|_| async {
-            match generate_portfolio_data().await {
-                Ok(data) => {
-                    let json = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
-                    Ok::<String, std::io::Error>(format!("data: {}\n\n", json))
-                }
-                Err(_) => Ok("data: {}\n\n".to_string())
-            }
-        });
+// Global state for portfolio data and broadcast channel
+#[derive(Clone)]
+struct AppState {
+    portfolio_data: Arc<RwLock<Option<PortfolioResponse>>>,
+    tx: broadcast::Sender<PortfolioResponse>,
+}
+
+async fn portfolio_stream(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    let mut rx = state.tx.subscribe();
+    
+    let stream = async_stream::stream! {
+        while let Ok(data) = rx.recv().await {
+            let json = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
+            yield Ok::<String, std::io::Error>(format!("data: {}\n\n", json));
+        }
+    };
 
     let body = axum::body::Body::from_stream(stream);
     Response::builder()
@@ -391,12 +421,192 @@ async fn generate_portfolio_data() -> Result<PortfolioResponse, StatusCode> {
 }
 
 async fn health_check() -> &'static str {
+    println!("🏥 Health check requested");
     "OK"
+}
+
+async fn update_stock_price(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(update): Json<StockPriceUpdate>
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    println!("📈 Stock price update requested: {} = ${}", update.symbol, update.price);
+    
+    // Force regenerate portfolio data with new price
+    match generate_portfolio_data_with_price(&update.symbol, update.price).await {
+        Ok(new_data) => {
+            // Cache the data and broadcast to SSE clients
+            {
+                let mut cached_data = state.portfolio_data.write().await;
+                let should_broadcast = match cached_data.as_ref() {
+                    Some(existing) => {
+                        existing.total_value != new_data.total_value ||
+                        existing.total_pnl != new_data.total_pnl ||
+                        existing.positions.len() != new_data.positions.len()
+                    }
+                    None => true,
+                };
+                
+                if should_broadcast {
+                    *cached_data = Some(new_data.clone());
+                    println!("🔄 Broadcasting updated portfolio data via SSE");
+                    let _ = state.tx.send(new_data.clone());
+                }
+            }
+            
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "message": format!("Updated {} price to ${}", update.symbol, update.price)
+            })))
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StockPriceUpdate {
+    symbol: String,
+    price: f64,
+}
+
+async fn generate_portfolio_data_with_price(symbol: &str, new_price: f64) -> Result<PortfolioResponse, StatusCode> {
+    // Initialize services
+    let market_data = MockMarketDataProvider::new();
+    let black_scholes = BlackScholesModel::new();
+    let risk_engine = RiskEngine::new(0.95, 1, 10000);
+    let portfolio_service = PortfolioValuationService::new(risk_engine);
+    
+    // Create sample instruments with updated price
+    let aapl_stock = Stock::new("AAPL".to_string(), "USD".to_string(), 100.0);
+    let aapl_call = FinancialOption::new(
+        "AAPL".to_string(),
+        "USD".to_string(),
+        OptionType::Call,
+        180.0,
+        Utc::now() + Duration::days(30),
+        10.0,
+        ExerciseStyle::European,
+    );
+    
+    // Create portfolio
+    let mut portfolio = Portfolio::new("Demo Portfolio".to_string(), "USD".to_string());
+    portfolio.add_position(aapl_stock.id().to_string(), 100.0, Some(175.00));
+    portfolio.add_position(aapl_call.id().to_string(), 10.0, Some(5.50));
+    
+    // Prepare instruments map
+    let mut instruments = HashMap::new();
+    instruments.insert(aapl_stock.id().to_string(), Box::new(aapl_stock) as Box<dyn Instrument + Send + Sync>);
+    instruments.insert(aapl_call.id().to_string(), Box::new(aapl_call) as Box<dyn Instrument + Send + Sync>);
+    
+    // Get market context with updated price
+    let mut market_context = market_data.get_market_context("AAPL").await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Override the spot price with the new price
+    market_context.spot_price = Some(new_price);
+    
+    // Value portfolio with new price
+    let valuation_result = portfolio_service.value_portfolio(&portfolio, &instruments, &black_scholes, &market_context).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Calculate positions with updated values
+    let mut positions = Vec::new();
+    let mut total_delta = 0.0;
+    let mut total_gamma = 0.0;
+    let mut total_theta = 0.0;
+    let mut total_vega = 0.0;
+    let mut total_rho = 0.0;
+    
+    for position in portfolio.positions.iter() {
+        if let Some(instrument) = instruments.get(&position.instrument_id) {
+            let position_value = valuation_result.positions.iter()
+                .find(|p| p.instrument_id == position.instrument_id)
+                .map(|p| p.total_value)
+                .unwrap_or(0.0);
+            
+            // Calculate market value based on new price for stocks
+            let market_value = if matches!(instrument.instrument_type(), InstrumentType::Stock) {
+                position.quantity * new_price
+            } else {
+                position_value
+            };
+            
+            let pnl = position.average_cost.map(|cost| market_value - (cost * position.quantity)).unwrap_or(0.0);
+            let weight = (market_value / valuation_result.total_value) * 100.0;
+            
+            let (delta, gamma, theta, vega, rho) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            
+            total_delta += delta;
+            total_gamma += gamma;
+            total_theta += theta;
+            total_vega += vega;
+            total_rho += rho;
+            
+            positions.push(PositionResponse {
+                instrument_id: position.instrument_id.clone(),
+                instrument_type: format!("{:?}", instrument.instrument_type()),
+                symbol: if matches!(instrument.instrument_type(), InstrumentType::Stock) { symbol.to_string() } else { format!("{} Call $180", symbol) },
+                quantity: position.quantity,
+                market_value,
+                pnl,
+                weight,
+                delta,
+                gamma,
+                theta,
+                vega,
+                rho,
+            });
+        }
+    }
+    
+    // Calculate exposures
+    let mut by_instrument_type = HashMap::new();
+    let mut by_underlying = HashMap::new();
+    
+    for position in &positions {
+        *by_instrument_type.entry(position.instrument_type.clone()).or_insert(0.0) += position.market_value;
+        *by_underlying.entry(symbol.to_string()).or_insert(0.0) += position.market_value;
+    }
+    
+    // Calculate updated total value
+    let total_value: f64 = positions.iter().map(|p| p.market_value).sum();
+    let total_pnl: f64 = positions.iter().map(|p| p.pnl).sum();
+    
+    let response = PortfolioResponse {
+        total_value,
+        total_pnl,
+        total_var: 356.11, // Mock value
+        portfolio_volatility: 0.2,
+        sharpe_ratio: 1.25,
+        max_drawdown: 8.5,
+        positions,
+        greeks: GreeksResponse {
+            total_delta,
+            total_gamma,
+            total_theta,
+            total_vega,
+            total_rho,
+        },
+        exposures: ExposuresResponse {
+            by_instrument_type,
+            by_underlying,
+        },
+    };
+    
+    Ok(response)
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    
+    // Create broadcast channel for SSE events
+    let (tx, _rx) = broadcast::channel(100);
+    
+    // Initialize app state
+    let app_state = AppState {
+        portfolio_data: Arc::new(RwLock::new(None)),
+        tx,
+    };
     
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -406,12 +616,15 @@ async fn main() {
     let app = Router::new()
         .route("/api/portfolio", get(get_portfolio_data))
         .route("/api/portfolio/stream", get(portfolio_stream))
+        .route("/api/portfolio/update", post(update_stock_price))
         .route("/health", get(health_check))
-        .layer(ServiceBuilder::new().layer(cors));
+        .layer(ServiceBuilder::new().layer(cors))
+        .with_state(app_state);
     
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("🚀 Valuation Service API running on http://localhost:8080");
     println!("📊 Dashboard API available at http://localhost:8080/api/portfolio");
+    println!("🔄 SSE events will be sent only when portfolio data changes");
     
     axum::serve(listener, app).await.unwrap();
 }
