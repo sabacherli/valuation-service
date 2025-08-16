@@ -1,1 +1,0 @@
-fn(axum::extract::State<AppState>, axum::Json<CreatePortfolioRequest>) -> impl std::future::Future<Output = Result<axum::Json<valuation_service::Portfolio>, ValuationError>> {create_portfolio}

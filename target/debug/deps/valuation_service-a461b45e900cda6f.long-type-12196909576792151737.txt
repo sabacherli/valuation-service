@@ -1,1 +1,0 @@
-fn(axum::extract::State<AppState>, axum::extract::Path<std::string::String>, Query<ValuationQuery>) -> impl std::future::Future<Output = Result<Json<serde_json::Value>, axum::http::StatusCode>> {value_portfolio}

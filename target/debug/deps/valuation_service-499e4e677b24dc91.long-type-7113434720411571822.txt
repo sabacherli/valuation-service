@@ -1,1 +1,0 @@
-fn(axum::extract::State<AppState>, axum::Json<CreateStockRequest>) -> impl std::future::Future<Output = Result<axum::Json<std::string::String>, ValuationError>> {create_stock}

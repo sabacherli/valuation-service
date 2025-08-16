@@ -1,1 +1,0 @@
-&tokio::sync::RwLockReadGuard<'_, HashMap<std::string::String, Box<dyn valuation_service::Instrument + Send + Sync>>>
