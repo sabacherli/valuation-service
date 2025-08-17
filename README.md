@@ -62,8 +62,8 @@ curl -X POST http://localhost:3000/portfolio/positions \
 ```json
 {
   "symbol": "string",      // Stock symbol (e.g., "AAPL", "GOOGL")
-  "quantity": number,       // Number of shares
-  "average_cost": number    // Optional: Average cost per share
+  "quantity": "number",       // Number of shares
+  "average_cost": "number"    // Optional: Average cost per share
 }
 ```
 
@@ -116,7 +116,7 @@ curl -X PUT http://localhost:3000/portfolio/positions/550e8400-e29b-41d4-a716-44
 **Request Body**
 ```json
 {
-  "quantity": number  // New quantity for the position
+  "quantity": "number" 
 }
 ```
 
@@ -254,7 +254,7 @@ curl -X POST http://localhost:3000/update-price \
 ```json
 {
   "symbol": "string",  // Stock symbol (e.g., "AAPL", "MSFT")
-  "price": number      // New price for the stock
+  "price": "number"    // New price for the stock
 }
 ```
 
