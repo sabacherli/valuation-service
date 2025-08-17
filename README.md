@@ -1,33 +1,48 @@
 # Valuation Service
 
-A comprehensive Rust-based valuation service for trading and risk management systems. This service provides real-time valuation of financial instruments, portfolio management, and risk analytics.
+A lightweight Rust-based web service for real-time portfolio valuation with Server-Sent Events (SSE) for live updates.
 
 ## Features
 
-### Core Capabilities
-- **Multi-Asset Valuation**: Support for stocks, bonds, options, futures, swaps, and forwards
-- **Advanced Pricing Models**: Black-Scholes, Monte Carlo simulation, and extensible model framework
-- **Portfolio Management**: Complete portfolio construction, valuation, and performance analytics
-- **Risk Management**: VaR, Expected Shortfall, Greeks calculation, and stress testing
-- **Market Data Integration**: Mock and live market data providers with retry mechanisms
+- **Real-time Updates**: Server-Sent Events (SSE) for live portfolio valuation
+- **RESTful API**: Simple HTTP endpoints for portfolio management
+- **Modern Web Stack**: Built with Axum and Tokio for high performance
+- **CORS Support**: Ready for web frontend integration
 
-### Financial Instruments
-- **Stocks**: Equity positions with dividend yield support
-- **Bonds**: Fixed-income securities with coupon payments and credit ratings
-- **Options**: European, American, and Bermudan exercise styles with full Greeks
-- **Extensible**: Easy to add new instrument types
+### API Endpoints
 
-### Pricing Models
-- **Black-Scholes**: Analytical pricing for European options with Greeks
-- **Monte Carlo**: Path-dependent pricing with confidence intervals
-- **Modular Design**: Easy to implement custom pricing models
+#### Portfolio Management
+- `GET /portfolio` - Get current portfolio valuation
+  ```bash
+  curl http://localhost:3000/portfolio
+  ```
 
-### Risk Analytics
-- **Value at Risk (VaR)**: 1-day and 10-day VaR calculations
-- **Expected Shortfall**: Conditional VaR for tail risk assessment
-- **Greeks**: Delta, Gamma, Theta, Vega, Rho for options
-- **Stress Testing**: Market shock, volatility, and rate stress scenarios
-- **Correlation Analysis**: Portfolio correlation matrices and component VaR
+- `POST /update-price` - Update a stock price
+  ```bash
+  curl -X POST http://localhost:3000/update-price \
+    -H "Content-Type: application/json" \
+    -d '{"symbol": "AAPL", "price": 185.0}'
+  ```
+  
+  Request Body:
+  ```json
+  {
+    "symbol": "string",  // Stock symbol (e.g., "AAPL", "MSFT")
+    "price": number      // New price for the stock
+  }
+  ```
+
+#### Real-time Updates
+- `GET /stream` - Server-Sent Events (SSE) stream of portfolio updates
+  ```bash
+  curl -N http://localhost:3000/stream
+  ```
+
+#### System
+- `GET /health` - Health check endpoint
+  ```bash
+  curl http://localhost:3000/health
+  ```
 
 ## Architecture
 

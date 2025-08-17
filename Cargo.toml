@@ -3,39 +3,44 @@ name = "valuation-service"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "valuation-service"
-path = "src/main.rs"
-
-[[bin]]
-name = "simple_main"
-path = "src/bin/simple_main.rs"
-
-[[bin]]
-name = "web_server"
-path = "src/bin/web_server.rs"
-
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
+# Web Framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# SSE
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+
+# Utils
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
-anyhow = "1.0"
-axum = { version = "0.7", features = ["macros"] }
-tokio-stream = "0.1"
-async-stream = "0.3"
-tower = "0.5"
-tower-http = { version = "0.5", features = ["cors"] }
-nalgebra = "0.32"
-rand = "0.8"
+
+# Random number generation
+rand = { version = "0.8", features = ["std", "std_rng"] }
 rand_distr = "0.4"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# HTTP client
 reqwest = { version = "0.11", features = ["json"] }
+futures-util = "0.3"
+async-stream = "0.3"
+
+# Math and statistics
+nalgebra = { version = "0.32", features = ["serde-serialize"] }
 statrs = "0.16"
-tracing = "0.1"
-tracing-subscriber = "0.3"
 
 [dev-dependencies]
-tokio-test = "0.4"
-approx = "0.5"
+# Testing
+reqwest = { version = "0.11", features = ["json"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2.3"
