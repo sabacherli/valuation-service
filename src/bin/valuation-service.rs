@@ -239,6 +239,13 @@ async fn update_price(
 async fn stream_updates(State(state): State<Arc<AppState>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
     let stream = async_stream::stream! {
+        // Send an initial snapshot immediately upon connection
+        let initial = generate_portfolio_update().await;
+        if let Ok(data) = serde_json::to_string(&initial) {
+            yield Ok(Event::default().data(data));
+        }
+
+        // Then forward broadcast updates as they arrive
         let mut rx = BroadcastStream::new(rx);
         while let Some(Ok(update)) = rx.next().await {
             match serde_json::to_string(&update) {
