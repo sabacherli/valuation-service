@@ -10,7 +10,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::{Arc, Mutex}, time::Duration};
 use tokio::sync::broadcast::{self, Sender};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -22,6 +22,8 @@ use tracing_subscriber::FmtSubscriber;
 #[derive(Clone)]
 struct AppState {
     tx: Sender<PortfolioUpdate>,
+    // In-memory portfolio state (protected by Mutex for interior mutability)
+    portfolio: Arc<Mutex<PortfolioUpdate>>, 
 }
 
 // Portfolio update message for SSE
@@ -60,14 +62,9 @@ struct UpdatePositionRequest {
     quantity: f64,
 }
 
-// Generate a sample portfolio update
-async fn generate_portfolio_update() -> PortfolioUpdate {
-    // Start with an empty portfolio state (no mock positions)
-    PortfolioUpdate {
-        timestamp: Utc::now().to_rfc3339(),
-        portfolio_value: 0.0,
-        positions: vec![],
-    }
+// Recalculate portfolio_value from positions
+fn recalc_portfolio_value(p: &mut PortfolioUpdate) {
+    p.portfolio_value = p.positions.iter().map(|pos| pos.value).sum();
 }
 
 // Handler for DELETE /portfolio/positions/{position_id}
@@ -87,9 +84,10 @@ async fn delete_position(
         "status": "deleted"
     });
     
-    // Send update to SSE subscribers
-    let update = generate_portfolio_update().await;
-    let _ = state.tx.send(update);
+    // Broadcast current state (no-op placeholder until delete is implemented)
+    if let Ok(locked) = state.portfolio.lock() {
+        let _ = state.tx.send(locked.clone());
+    }
     
     (StatusCode::OK, Json(response))
 }
@@ -114,9 +112,10 @@ async fn update_position(
         "status": "updated"
     });
     
-    // Send update to SSE subscribers
-    let update = generate_portfolio_update().await;
-    let _ = state.tx.send(update);
+    // Broadcast current state (no-op placeholder until update by ID is implemented)
+    if let Ok(locked) = state.portfolio.lock() {
+        let _ = state.tx.send(locked.clone());
+    }
     
     (StatusCode::OK, Json(response))
 }
@@ -134,18 +133,36 @@ async fn add_position(
     // For now, we'll just log the request and return a success response
     info!("Adding position: {:?}", payload);
     
-    // Generate a mock response
+    // Generate a position and add it to the in-memory portfolio
+    let position_id = Uuid::new_v4().to_string();
+    {
+        if let Ok(mut portfolio) = state.portfolio.lock() {
+            // Default new positions to price 0 and value 0 until a price is provided
+            let pos = Position {
+                symbol: payload.symbol.clone(),
+                quantity: payload.quantity,
+                price: 0.0,
+                value: 0.0,
+            };
+            portfolio.positions.push(pos);
+            portfolio.timestamp = Utc::now().to_rfc3339();
+            recalc_portfolio_value(&mut portfolio);
+        }
+    }
+
+    // Build response
     let response = json!({
-        "position_id": Uuid::new_v4().to_string(),
+        "position_id": position_id,
         "symbol": payload.symbol,
         "quantity": payload.quantity,
         "average_cost": payload.average_cost,
         "status": "added"
     });
-    
-    // Send update to SSE subscribers
-    let update = generate_portfolio_update().await;
-    let _ = state.tx.send(update);
+
+    // Broadcast updated portfolio to SSE subscribers
+    if let Ok(locked) = state.portfolio.lock() {
+        let _ = state.tx.send(locked.clone());
+    }
     
     (StatusCode::CREATED, Json(response))
 }
@@ -197,9 +214,14 @@ async fn get_portfolio_risk(_state: State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 // Handler for GET /portfolio
-async fn get_portfolio(_state: State<Arc<AppState>>) -> impl IntoResponse {
-    let update = generate_portfolio_update().await;
-    Json(update)
+async fn get_portfolio(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Return current in-memory portfolio
+    let body = if let Ok(locked) = state.portfolio.lock() {
+        locked.clone()
+    } else {
+        PortfolioUpdate { timestamp: Utc::now().to_rfc3339(), portfolio_value: 0.0, positions: vec![] }
+    };
+    Json(body)
 }
 
 // Handler for POST /update-price
@@ -209,11 +231,18 @@ async fn update_price(
 ) -> impl IntoResponse {
     info!("Updating price for {} to {}", update_req.symbol, update_req.price);
     
-    // In a real implementation, we would update the price in our data store
-    // For now, we'll just log it and generate a new portfolio update
-    
-    let update = generate_portfolio_update().await;
-    let _ = state.tx.send(update.clone());
+    // Update price in the in-memory portfolio if symbol exists
+    if let Ok(mut portfolio) = state.portfolio.lock() {
+        for pos in &mut portfolio.positions {
+            if pos.symbol == update_req.symbol {
+                pos.price = update_req.price;
+                pos.value = pos.quantity * pos.price;
+            }
+        }
+        portfolio.timestamp = Utc::now().to_rfc3339();
+        recalc_portfolio_value(&mut portfolio);
+        let _ = state.tx.send(portfolio.clone());
+    }
     
     (StatusCode::OK, Json(json!({
         "status": "price_updated",
@@ -227,10 +256,12 @@ async fn update_price(
 async fn stream_updates(State(state): State<Arc<AppState>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
     let stream = async_stream::stream! {
-        // Send an initial snapshot immediately upon connection
-        let initial = generate_portfolio_update().await;
-        if let Ok(data) = serde_json::to_string(&initial) {
-            yield Ok(Event::default().data(data));
+        // Send an initial snapshot of the current in-memory portfolio
+        let initial = state.portfolio.lock().ok().map(|p| p.clone());
+        if let Some(initial) = initial {
+            if let Ok(data) = serde_json::to_string(&initial) {
+                yield Ok(Event::default().data(data));
+            }
         }
 
         // Then forward broadcast updates as they arrive
@@ -265,13 +296,24 @@ async fn main() {
 
     // Create broadcast channel for SSE
     let (tx, _) = broadcast::channel(100);
-    let state = Arc::new(AppState { tx });
+    // Initialize empty in-memory portfolio
+    let initial_portfolio = PortfolioUpdate {
+        timestamp: Utc::now().to_rfc3339(),
+        portfolio_value: 0.0,
+        positions: vec![],
+    };
+    let state = Arc::new(AppState { tx, portfolio: Arc::new(Mutex::new(initial_portfolio)) });
 
     // Set up CORS
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_headers([header::CONTENT_TYPE])
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST]);
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+        ]);
 
     // Build our application with routes
     let app = Router::new()
