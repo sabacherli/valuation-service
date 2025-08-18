@@ -62,23 +62,11 @@ struct UpdatePositionRequest {
 
 // Generate a sample portfolio update
 async fn generate_portfolio_update() -> PortfolioUpdate {
+    // Start with an empty portfolio state (no mock positions)
     PortfolioUpdate {
         timestamp: Utc::now().to_rfc3339(),
-        portfolio_value: 1_000_000.0,
-        positions: vec![
-            Position {
-                symbol: "AAPL".to_string(),
-                quantity: 100.0,
-                price: 180.0,
-                value: 18_000.0,
-            },
-            Position {
-                symbol: "MSFT".to_string(),
-                quantity: 50.0,
-                price: 300.0,
-                value: 15_000.0,
-            },
-        ],
+        portfolio_value: 0.0,
+        positions: vec![],
     }
 }
 
