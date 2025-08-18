@@ -35,131 +35,150 @@ The service will be available at `http://localhost:3000`
 ## 📚 API Reference
 
 ### Base URL
-All API endpoints are relative to `http://localhost:3000`
+All API endpoints are relative to `http://localhost:3000`.
 
 ### Authentication
-This service currently doesn't require authentication.
+No authentication is required.
+
+### Notes
+- The portfolio now starts empty (no mock data).
+- Some endpoints return mock-style responses but do not yet persist changes.
 
 ### Endpoints
 
-#### Portfolio Management
+#### 1) Portfolio
 
-### Position Management
+##### Get Portfolio
+```http
+GET /portfolio
+```
 
-#### Add Position to Portfolio
+Returns the current portfolio snapshot.
+
+Example
+```bash
+curl -s http://localhost:3000/portfolio | jq
+```
+
+Response
+```json
+{
+  "timestamp": "2025-08-18T09:45:00Z",
+  "portfolio_value": 0.0,
+  "positions": []
+}
+```
+
+#### 2) Positions
+
+Endpoints to add, update, and delete positions. These currently emit an update event but do not persist state yet.
+
+##### Add Position
 ```http
 POST /portfolio/positions
 ```
 
-**Example Request**
-```bash
-curl -X POST http://localhost:3000/portfolio/positions \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "GOOGL", "quantity": 5, "average_cost": 2800.00}'
-```
-
-**Request Body**
+Request Body
 ```json
 {
-  "symbol": "string",      // Stock symbol (e.g., "AAPL", "GOOGL")
-  "quantity": "number",       // Number of shares
-  "average_cost": "number"    // Optional: Average cost per share
+  "symbol": "string",
+  "quantity": 123.45,
+  "average_cost": 100.0
 }
 ```
 
-**Example Response**
+Example
+```bash
+curl -X POST http://localhost:3000/portfolio/positions \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"GOOGL","quantity":5,"average_cost":2800.0}'
+```
+
+Response
 ```json
 {
   "position_id": "550e8400-e29b-41d4-a716-446655440000",
   "symbol": "GOOGL",
-  "quantity": 5,
-  "average_cost": 2800.00,
+  "quantity": 5.0,
+  "average_cost": 2800.0,
   "status": "added"
 }
 ```
 
-#### Get Position Details
-```http
-GET /portfolio/positions/{position_id}
-```
-
-**Example Request**
-```bash
-curl -X GET http://localhost:3000/portfolio/positions/550e8400-e29b-41d4-a716-446655440000
-```
-
-**Example Response**
-```json
-{
-  "position_id": "550e8400-e29b-41d4-a716-446655440000",
-  "symbol": "GOOGL",
-  "quantity": 5,
-  "average_cost": 2800.00,
-  "current_value": 14000.00,
-  "unrealized_pnl": 500.00,
-  "entry_date": "2025-08-17T21:00:00Z"
-}
-```
-
-#### Update Position
+##### Update Position
 ```http
 PUT /portfolio/positions/{position_id}
 ```
 
-**Example Request**
+Request Body
+```json
+{ "quantity": 8.0 }
+```
+
+Example
 ```bash
 curl -X PUT http://localhost:3000/portfolio/positions/550e8400-e29b-41d4-a716-446655440000 \
   -H "Content-Type: application/json" \
   -d '{"quantity": 8}'
 ```
 
-**Request Body**
+Response
 ```json
-{
-  "quantity": "number" 
-}
+{ "position_id": "550e8400-e29b-41d4-a716-446655440000", "quantity": 8.0, "status": "updated" }
 ```
 
-**Example Response**
-```json
-{
-  "position_id": "550e8400-e29b-41d4-a716-446655440000",
-  "quantity": 8,
-  "status": "updated"
-}
-```
-
-#### Delete Position
+##### Delete Position
 ```http
 DELETE /portfolio/positions/{position_id}
 ```
 
-**Example Request**
+Example
 ```bash
 curl -X DELETE http://localhost:3000/portfolio/positions/550e8400-e29b-41d4-a716-446655440000
 ```
 
-**Example Response**
+Response
 ```json
-{
-  "position_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "deleted"
-}
+{ "position_id": "550e8400-e29b-41d4-a716-446655440000", "status": "deleted" }
 ```
 
-### Portfolio Analysis
+#### 3) Market Data
 
-#### Get Portfolio Risk Metrics
+##### Update Stock Price
+```http
+POST /update-price
+```
+
+Request Body
+```json
+{ "symbol": "AAPL", "price": 190.50 }
+```
+
+Example
+```bash
+curl -X POST http://localhost:3000/update-price \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"AAPL","price":190.50}'
+```
+
+Response
+```
+200 OK
+```
+
+#### 4) Analysis
+
+##### Get Portfolio Risk Metrics
 ```http
 GET /portfolio/analysis/risk
 ```
 
-**Example Request**
+Example
 ```bash
-curl -X GET http://localhost:3000/portfolio/analysis/risk
+curl -s http://localhost:3000/portfolio/analysis/risk | jq
 ```
 
-**Example Response**
+Response (mocked)
 ```json
 {
   "portfolio_value": 1000000.0,
@@ -175,17 +194,17 @@ curl -X GET http://localhost:3000/portfolio/analysis/risk
 }
 ```
 
-#### Get Portfolio Performance Metrics
+##### Get Portfolio Performance Metrics
 ```http
 GET /portfolio/analysis/performance
 ```
 
-**Example Request**
+Example
 ```bash
-curl -X GET http://localhost:3000/portfolio/analysis/performance
+curl -s http://localhost:3000/portfolio/analysis/performance | jq
 ```
 
-**Example Response**
+Response (mocked)
 ```json
 {
   "total_return": 150000.0,
@@ -207,100 +226,40 @@ curl -X GET http://localhost:3000/portfolio/analysis/performance
 }
 ```
 
-#### Get Portfolio Valuation
-```http
-GET /portfolio
-```
-
-**Example Request**
-```bash
-curl -X GET http://localhost:3000/portfolio
-```
-
-**Example Response**
-```json
-{
-  "total_value": 50000.0,
-  "positions": [
-    {
-      "symbol": "AAPL",
-      "quantity": 10,
-      "price": 185.0,
-      "value": 1850.0
-    },
-    {
-      "symbol": "MSFT",
-      "quantity": 5,
-      "price": 300.0,
-      "value": 1500.0
-    }
-  ]
-}
-```
-
-##### Update Stock Price
-```http
-POST /update-price
-```
-
-**Example Request**
-```bash
-curl -X POST http://localhost:3000/update-price \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "AAPL", "price": 190.50}'
-```
-
-**Request Body**
-```json
-{
-  "symbol": "string",  // Stock symbol (e.g., "AAPL", "MSFT")
-  "price": "number"    // New price for the stock
-}
-```
-
-**Response**
-```
-200 OK
-```
-
-#### Real-time Updates
+#### 5) Real-time Updates
 
 ##### SSE Stream
 ```http
 GET /stream
 ```
 
-**Example Request**
+Example
 ```bash
 curl -N http://localhost:3000/stream
 ```
 
-**Headers**
+Headers
 ```
 Accept: text/event-stream
 Cache-Control: no-cache
 Connection: keep-alive
 ```
 
-**Example Event**
-```
-event: update
-data: {"symbol":"AAPL","price":190.5,"timestamp":"2025-08-17T20:30:00Z"}
-```
+Events are JSON-serialized portfolio snapshots.
 
-#### System
+#### 6) System
 
 ##### Health Check
 ```http
 GET /health
 ```
 
-**Example Request**
+Example
 ```bash
-curl -X GET http://localhost:3000/health
+curl -s http://localhost:3000/health
 ```
 
-**Response**
+Response
 ```
 200 OK
 ```
