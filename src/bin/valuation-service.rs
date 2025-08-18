@@ -41,6 +41,9 @@ struct Position {
     quantity: f64,
     price: f64,
     value: f64,
+    average_cost: f64,
+    pnl: f64,
+    pnl_percent: f64,
 }
 
 // Request for updating a stock price
@@ -73,22 +76,26 @@ async fn delete_position(
     state: State<Arc<AppState>>,
 ) -> impl IntoResponse {
     info!("Deleting position: {}", position_id);
-    
-    // In a real implementation, we would:
-    // 1. Find the position by ID
-    // 2. Remove it from the portfolio
-    
-    // For now, just return a success response
+    // Remove any positions matching the provided identifier (treat as symbol for now)
+    let mut removed_count = 0usize;
+    if let Ok(mut portfolio) = state.portfolio.lock() {
+        let before = portfolio.positions.len();
+        portfolio.positions.retain(|p| p.symbol != position_id);
+        removed_count = before - portfolio.positions.len();
+        if removed_count > 0 {
+            portfolio.timestamp = Utc::now().to_rfc3339();
+            recalc_portfolio_value(&mut portfolio);
+        }
+        // Broadcast updated portfolio regardless
+        let _ = state.tx.send(portfolio.clone());
+    }
+
     let response = json!({
         "position_id": position_id,
-        "status": "deleted"
+        "removed": removed_count,
+        "status": if removed_count > 0 { "deleted" } else { "not_found" }
     });
-    
-    // Broadcast current state (no-op placeholder until delete is implemented)
-    if let Ok(locked) = state.portfolio.lock() {
-        let _ = state.tx.send(locked.clone());
-    }
-    
+
     (StatusCode::OK, Json(response))
 }
 
@@ -138,11 +145,20 @@ async fn add_position(
     {
         if let Ok(mut portfolio) = state.portfolio.lock() {
             // Default new positions to price 0 and value 0 until a price is provided
+            let average_cost = payload.average_cost.unwrap_or(0.0);
+            let price = 0.0;
+            let quantity = payload.quantity;
+            let value = quantity * price;
+            let pnl = (price - average_cost) * quantity;
+            let pnl_percent = if average_cost > 0.0 { (price - average_cost) / average_cost * 100.0 } else { 0.0 };
             let pos = Position {
                 symbol: payload.symbol.clone(),
-                quantity: payload.quantity,
-                price: 0.0,
-                value: 0.0,
+                quantity,
+                price,
+                value,
+                average_cost,
+                pnl,
+                pnl_percent,
             };
             portfolio.positions.push(pos);
             portfolio.timestamp = Utc::now().to_rfc3339();
@@ -237,6 +253,8 @@ async fn update_price(
             if pos.symbol == update_req.symbol {
                 pos.price = update_req.price;
                 pos.value = pos.quantity * pos.price;
+                pos.pnl = (pos.price - pos.average_cost) * pos.quantity;
+                pos.pnl_percent = if pos.average_cost > 0.0 { (pos.price - pos.average_cost) / pos.average_cost * 100.0 } else { 0.0 };
             }
         }
         portfolio.timestamp = Utc::now().to_rfc3339();
