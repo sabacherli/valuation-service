@@ -1,8 +1,105 @@
+// ----- Instruments Types -----
+#[derive(Debug, Deserialize)]
+struct InstrumentUpsertRequest {
+    symbol: String,
+    price: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct InstrumentItem {
+    symbol: String,
+    price: f64,
+}
+
+async fn load_prices(db: &Pool<Postgres>) -> HashMap<String, f64> {
+    let mut map: HashMap<String, f64> = HashMap::new();
+    if let Ok(rows) = sqlx::query("SELECT symbol, price FROM instruments")
+        .fetch_all(db)
+        .await
+    {
+        for row in rows {
+            let symbol: String = row.get("symbol");
+            let price: f64 = row.get("price");
+            map.insert(symbol, price);
+        }
+    }
+    map
+}
+
+// GET /instruments
+async fn get_instruments(State(state): State<Arc<AppState>>) -> Response {
+    let rows = sqlx::query("SELECT symbol, price FROM instruments ORDER BY symbol ASC")
+        .fetch_all(&state.db)
+        .await;
+    match rows {
+        Ok(rows) => {
+            let items: Vec<InstrumentItem> = rows
+                .into_iter()
+                .map(|r| InstrumentItem { symbol: r.get("symbol"), price: r.get("price") })
+                .collect();
+            (StatusCode::OK, Json(items)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to fetch instruments: {}", e)})),
+        ).into_response(),
+    }
+}
+
+// POST /instruments (create or update price)
+async fn upsert_instrument(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<InstrumentUpsertRequest>,
+) -> impl IntoResponse {
+    let _ = sqlx::query(
+        "INSERT INTO instruments (symbol, price) VALUES ($1, $2)
+         ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price",
+    )
+    .bind(&req.symbol)
+    .bind(req.price)
+    .execute(&state.db)
+    .await;
+
+    // Rebuild portfolio with new prices
+    let lots = compute_lots_from_db(&state.db).await;
+    let prices = load_prices(&state.db).await;
+    if let Ok(mut portfolio) = state.portfolio.lock() {
+        let updated = build_portfolio_update_from_lots(&lots, &prices);
+        *portfolio = updated.clone();
+        let _ = state.tx.send(updated);
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({"symbol": req.symbol, "price": req.price})))
+}
+
+// DELETE /instruments/:symbol
+async fn delete_instrument(State(state): State<Arc<AppState>>, Path(symbol): Path<String>) -> impl IntoResponse {
+    let res = sqlx::query("DELETE FROM instruments WHERE symbol = $1")
+        .bind(&symbol)
+        .execute(&state.db)
+        .await;
+    match res {
+        Ok(_) => {
+            // Rebuild with prices after deletion
+            let lots = compute_lots_from_db(&state.db).await;
+            let prices = load_prices(&state.db).await;
+            if let Ok(mut portfolio) = state.portfolio.lock() {
+                let updated = build_portfolio_update_from_lots(&lots, &prices);
+                *portfolio = updated.clone();
+                let _ = state.tx.send(updated);
+            }
+            (StatusCode::NO_CONTENT, Json(serde_json::json!({"status": "deleted"})))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to delete: {}", e)})),
+        ),
+    }
+}
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{header, StatusCode},
-    response::{sse::Event, IntoResponse, Sse},
-    routing::{get, post, put},
+    response::{sse::Event, IntoResponse, Sse, Response},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::Utc;
@@ -10,7 +107,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
-use std::{convert::Infallible, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, convert::Infallible, sync::{Arc, Mutex}, time::Duration};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
 use std::env;
 use tokio::sync::broadcast::{self, Sender};
@@ -28,6 +125,83 @@ struct AppState {
     portfolio: Arc<Mutex<PortfolioUpdate>>, 
     // Database pool for persistence
     db: Pool<Postgres>,
+}
+
+// Utilities to rebuild individual lots (positions) from transaction history
+// Each BUY creates a lot; SELL reduces quantities from existing lots FIFO.
+async fn compute_lots_from_db(db: &Pool<Postgres>) -> HashMap<String, Vec<(f64, f64)>> {
+    // Returns symbol -> Vec<(quantity, avg_cost_per_lot)>
+    let mut lots: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let rows = sqlx::query(
+        "SELECT type, symbol, quantity, price, timestamp, id FROM transactions ORDER BY timestamp ASC, id ASC",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for row in rows {
+        let t: String = row.get::<String, _>("type");
+        let symbol: String = row.get::<String, _>("symbol");
+        let qty: f64 = row.get::<f64, _>("quantity");
+        let price: f64 = row.try_get("price").ok().flatten().unwrap_or(0.0);
+
+        let entry = lots.entry(symbol).or_default();
+        match t.as_str() {
+            "BUY" => {
+                // Add a new lot
+                if qty > 0.0 {
+                    entry.push((qty, price));
+                }
+            }
+            "SELL" => {
+                // Reduce FIFO
+                let mut to_sell = qty.max(0.0);
+                let mut i = 0usize;
+                while to_sell > 0.0 && i < entry.len() {
+                    let (ref mut lot_qty, _lot_price) = entry[i];
+                    if *lot_qty <= to_sell + f64::EPSILON {
+                        to_sell -= *lot_qty;
+                        *lot_qty = 0.0;
+                        i += 1;
+                    } else {
+                        *lot_qty -= to_sell;
+                        to_sell = 0.0;
+                    }
+                }
+                // Remove depleted lots
+                entry.retain(|(q, _)| *q > f64::EPSILON);
+            }
+            _ => { /* ignore unknown types */ }
+        }
+    }
+    lots
+}
+
+fn build_portfolio_update_from_lots(
+    lots: &HashMap<String, Vec<(f64, f64)>>,
+    existing_prices: &HashMap<String, f64>,
+) -> PortfolioUpdate {
+    let mut positions: Vec<Position> = Vec::new();
+    for (symbol, lot_list) in lots.iter() {
+        for (qty, avg) in lot_list {
+            if *qty <= 0.0 { continue; }
+            let price = existing_prices.get(symbol).copied().unwrap_or(0.0);
+            let value = price * *qty;
+            let pnl = (price - *avg) * *qty;
+            let pnl_percent = if *avg > 0.0 { (price - *avg) / *avg * 100.0 } else { 0.0 };
+            positions.push(Position {
+                symbol: symbol.clone(),
+                quantity: *qty,
+                price,
+                value,
+                average_cost: *avg,
+                pnl,
+                pnl_percent,
+            });
+        }
+    }
+    let portfolio_value = positions.iter().map(|p| p.value).sum();
+    PortfolioUpdate { timestamp: Utc::now().to_rfc3339(), portfolio_value, positions }
 }
 
 // Handler for GET /transactions
@@ -96,9 +270,44 @@ async fn add_transaction(
         price: req.price,
         timestamp: ts.to_rfc3339(),
     };
+    // Rebuild positions from DB, preserving existing prices per symbol
+    let lots = compute_lots_from_db(&state.db).await;
+    let prices = load_prices(&state.db).await;
+    if let Ok(mut portfolio) = state.portfolio.lock() {
+        let updated = build_portfolio_update_from_lots(&lots, &prices);
+        *portfolio = updated.clone();
+        let _ = state.tx.send(updated);
+    }
     (StatusCode::CREATED, Json(tx))
 }
 
+// Handler for DELETE /transactions (clear all)
+async fn clear_transactions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Delete all rows
+    let res = sqlx::query("DELETE FROM transactions")
+        .execute(&state.db)
+        .await;
+
+    match res {
+        Ok(_) => {
+            // Rebuild from empty DB with current instrument prices
+            let lots = compute_lots_from_db(&state.db).await;
+            let prices = load_prices(&state.db).await;
+            if let Ok(mut portfolio) = state.portfolio.lock() {
+                let updated = build_portfolio_update_from_lots(&lots, &prices);
+                *portfolio = updated.clone();
+                let _ = state.tx.send(updated);
+            }
+            (StatusCode::NO_CONTENT, Json(serde_json::json!({ "status": "cleared" })))
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to clear: {}", e) })),
+            )
+        }
+    }
+}
 // Portfolio update message for SSE
 #[derive(Debug, Clone, Serialize)]
 struct PortfolioUpdate {
@@ -408,12 +617,6 @@ async fn main() {
 
     // Create broadcast channel for SSE
     let (tx, _) = broadcast::channel(100);
-    // Initialize empty in-memory portfolio
-    let initial_portfolio = PortfolioUpdate {
-        timestamp: Utc::now().to_rfc3339(),
-        portfolio_value: 0.0,
-        positions: vec![],
-    };
     // Initialize Postgres connection pool
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/valuation".to_string());
     let db = PgPoolOptions::new()
@@ -422,16 +625,27 @@ async fn main() {
         .await
         .expect("Failed to connect to Postgres");
 
-    // Create transactions table if it doesn't exist
+    // Create tables if they don't exist
     let _ = sqlx::query(
         "CREATE TABLE IF NOT EXISTS transactions (\n            id UUID PRIMARY KEY,\n            type TEXT NOT NULL,\n            symbol TEXT NOT NULL,\n            quantity DOUBLE PRECISION NOT NULL,\n            price DOUBLE PRECISION,\n            timestamp TIMESTAMPTZ NOT NULL\n        )"
     )
     .execute(&db)
     .await;
 
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS instruments (\n            symbol TEXT PRIMARY KEY,\n            price DOUBLE PRECISION NOT NULL\n        )"
+    )
+    .execute(&db)
+    .await;
+
+    // Build initial in-memory portfolio from persisted transactions (as individual lots)
+    let lots = compute_lots_from_db(&db).await;
+    let prices = load_prices(&db).await;
+    let initial_from_db = build_portfolio_update_from_lots(&lots, &prices);
+
     let state = Arc::new(AppState {
         tx,
-        portfolio: Arc::new(Mutex::new(initial_portfolio)),
+        portfolio: Arc::new(Mutex::new(initial_from_db)),
         db,
     });
 
@@ -444,6 +658,7 @@ async fn main() {
             axum::http::Method::POST,
             axum::http::Method::PUT,
             axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
         ]);
 
     // Build our application with routes
@@ -456,7 +671,10 @@ async fn main() {
         .route("/portfolio/positions", post(add_position))
         .route("/portfolio/positions/:position_id", put(update_position).delete(delete_position))
         // Transactions
-        .route("/transactions", get(get_transactions).post(add_transaction))
+        .route("/transactions", get(get_transactions).post(add_transaction).delete(clear_transactions))
+        // Instruments
+        .route("/instruments", get(get_instruments).post(upsert_instrument))
+        .route("/instruments/:symbol", delete(delete_instrument))
         
         // Portfolio Analysis
         .route("/portfolio/analysis/risk", get(get_portfolio_risk))
