@@ -9,12 +9,55 @@ A high-performance, real-time portfolio valuation service built with Rust, Axum,
 - **High Performance**: Built on Axum and Tokio for maximum throughput and low latency
 - **CORS Ready**: Pre-configured for seamless web frontend integration
 
+## ⚡ Quickstart (PostgreSQL + backend)
+
+From the root of this service repository (`valuation-service/`), run:
+
+```bash
+./start-dev.sh
+```
+
+The script is checked into this repository and is location‑independent (it resolves paths relative to the script file).
+
+Defaults:
+- Uses `DATABASE_URL=postgres://postgres:postgres@localhost:5433/valuation`
+- Backend: `valuation-service/` on `http://localhost:3000`
+  (Frontend should be started separately.)
+
+Make sure the script is executable:
+
+```bash
+chmod +x start-dev.sh
+```
+
+To override the database URL:
+
+```bash
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/valuation" ./start-dev.sh
+```
+
 ## 🚀 Getting Started
 
 ### Prerequisites
 
+- PostgreSQL 13+ server (local or Docker), reachable via `DATABASE_URL`
+  - Default used by the dev script: `postgres://postgres:postgres@localhost:5433/valuation`
+  - Alternatively set your own `DATABASE_URL`
 - Rust 1.65+ (install via [rustup](https://rustup.rs/))
 - Cargo (Rust's package manager)
+
+If you don’t use Docker, install Postgres locally (WSL example):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y postgresql postgresql-contrib
+sudo service postgresql start
+sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+sudo -u postgres createdb valuation
+
+# If needed, enable password auth and localhost access (edit pg_hba.conf)
+# Ensure Postgres is listening (commonly on port 5433 with PGDG packages)
+```
 
 ### Installation
 
@@ -25,12 +68,30 @@ cd valuation-service
 
 # Build in release mode
 cargo build --release
+```
 
-# Run the service
+## ▶️ Running the service
+
+Preferred (starts PostgreSQL if available and the backend):
+
+```bash
+./valuation-service/start-dev.sh
+```
+
+Manual run (PostgreSQL must already be running; this does NOT start it):
+
+Set `DATABASE_URL` (example if Postgres runs on 5433):
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@localhost:5433/valuation"
 cargo run --release
 ```
 
-The service will be available at `http://localhost:3000`
+If PostgreSQL is not running, you can start it (Ubuntu/WSL):
+
+```bash
+sudo service postgresql start
+```
 
 ## 📚 API Reference
 

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use std::{convert::Infallible, sync::{Arc, Mutex}, time::Duration};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
+use std::env;
 use tokio::sync::broadcast::{self, Sender};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -24,6 +26,77 @@ struct AppState {
     tx: Sender<PortfolioUpdate>,
     // In-memory portfolio state (protected by Mutex for interior mutability)
     portfolio: Arc<Mutex<PortfolioUpdate>>, 
+    // Database pool for persistence
+    db: Pool<Postgres>,
+}
+
+// Handler for GET /transactions
+async fn get_transactions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows = sqlx::query(
+        "SELECT id, type, symbol, quantity, price, timestamp FROM transactions ORDER BY timestamp DESC LIMIT 200"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let items: Vec<Transaction> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id: Option<Uuid> = row.try_get("id").ok();
+            let t: Option<String> = row.try_get("type").ok();
+            let symbol: Option<String> = row.try_get("symbol").ok();
+            let quantity: Option<f64> = row.try_get("quantity").ok();
+            let price: Option<f64> = row.try_get("price").ok();
+            let ts: Option<chrono::DateTime<chrono::Utc>> = row.try_get("timestamp").ok();
+            match (id, t, symbol, quantity, ts) {
+                (Some(id), Some(t), Some(symbol), Some(quantity), Some(ts)) => Some(Transaction {
+                    id: id.to_string(),
+                    r#type: t,
+                    symbol,
+                    quantity,
+                    price,
+                    timestamp: ts.to_rfc3339(),
+                }),
+                _ => None,
+            }
+        })
+        .collect();
+
+    (StatusCode::OK, Json(items))
+}
+
+// Handler for POST /transactions
+async fn add_transaction(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddTransactionRequest>,
+) -> impl IntoResponse {
+    let id = Uuid::new_v4();
+    let ts = req
+        .timestamp
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc)))
+        .unwrap_or_else(|| Utc::now());
+
+    let _ = sqlx::query(
+        "INSERT INTO transactions (id, type, symbol, quantity, price, timestamp) VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(id)
+    .bind(&req.r#type)
+    .bind(&req.symbol)
+    .bind(req.quantity)
+    .bind(req.price)
+    .bind(ts)
+    .execute(&state.db)
+    .await;
+
+    let tx = Transaction {
+        id: id.to_string(),
+        r#type: req.r#type,
+        symbol: req.symbol,
+        quantity: req.quantity,
+        price: req.price,
+        timestamp: ts.to_rfc3339(),
+    };
+    (StatusCode::CREATED, Json(tx))
 }
 
 // Portfolio update message for SSE
@@ -46,6 +119,17 @@ struct Position {
     pnl_percent: f64,
 }
 
+// Transaction log entry persisted in-memory (and served to clients)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Transaction {
+    id: String,
+    r#type: String, // "BUY" | "SELL"
+    symbol: String,
+    quantity: f64,
+    price: Option<f64>,
+    timestamp: String,
+}
+
 // Request for updating a stock price
 #[derive(Debug, Deserialize)]
 struct UpdatePriceRequest {
@@ -63,6 +147,16 @@ struct AddPositionRequest {
 #[derive(Debug, Deserialize)]
 struct UpdatePositionRequest {
     quantity: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddTransactionRequest {
+    r#type: String,
+    symbol: String,
+    quantity: f64,
+    price: Option<f64>,
+    // allow client to provide timestamp, otherwise server will set
+    timestamp: Option<String>,
 }
 
 // Recalculate portfolio_value from positions
@@ -320,7 +414,26 @@ async fn main() {
         portfolio_value: 0.0,
         positions: vec![],
     };
-    let state = Arc::new(AppState { tx, portfolio: Arc::new(Mutex::new(initial_portfolio)) });
+    // Initialize Postgres connection pool
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/valuation".to_string());
+    let db = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    // Create transactions table if it doesn't exist
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS transactions (\n            id UUID PRIMARY KEY,\n            type TEXT NOT NULL,\n            symbol TEXT NOT NULL,\n            quantity DOUBLE PRECISION NOT NULL,\n            price DOUBLE PRECISION,\n            timestamp TIMESTAMPTZ NOT NULL\n        )"
+    )
+    .execute(&db)
+    .await;
+
+    let state = Arc::new(AppState {
+        tx,
+        portfolio: Arc::new(Mutex::new(initial_portfolio)),
+        db,
+    });
 
     // Set up CORS
     let cors = CorsLayer::new()
@@ -342,6 +455,8 @@ async fn main() {
         .route("/portfolio", get(get_portfolio))
         .route("/portfolio/positions", post(add_position))
         .route("/portfolio/positions/:position_id", put(update_position).delete(delete_position))
+        // Transactions
+        .route("/transactions", get(get_transactions).post(add_transaction))
         
         // Portfolio Analysis
         .route("/portfolio/analysis/risk", get(get_portfolio_risk))
