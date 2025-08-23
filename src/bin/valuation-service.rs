@@ -5,6 +5,35 @@ struct InstrumentUpsertRequest {
     price: f64,
 }
 
+// ---- Price History ----
+#[derive(Debug, Deserialize)]
+struct HistoryQuery { days: Option<i64> }
+
+#[derive(Debug, Serialize)]
+struct HistoryPoint { timestamp: String, price: f64 }
+
+// GET /instruments/:symbol/history?days=5
+async fn get_price_history(State(state): State<Arc<AppState>>, Path(symbol): Path<String>, Query(q): Query<HistoryQuery>) -> impl IntoResponse {
+    let days = q.days.unwrap_or(5).max(1);
+    let since = Utc::now() - ChronoDuration::days(days);
+    let rows = sqlx::query("SELECT price, ts FROM price_history WHERE symbol = $1 AND ts >= $2 ORDER BY ts ASC")
+        .bind(&symbol)
+        .bind(since)
+        .fetch_all(&state.db)
+        .await;
+    match rows {
+        Ok(rows) => {
+            let data: Vec<HistoryPoint> = rows.into_iter().filter_map(|r| {
+                let price: Option<f64> = r.try_get("price").ok();
+                let ts: Option<chrono::DateTime<chrono::Utc>> = r.try_get("ts").ok();
+                match (price, ts) { (Some(p), Some(t)) => Some(HistoryPoint { timestamp: t.to_rfc3339(), price: p }), _ => None }
+            }).collect();
+            (StatusCode::OK, Json(data)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("failed to fetch history: {}", e)}))).into_response()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct InstrumentItem {
     symbol: String,
@@ -60,6 +89,15 @@ async fn upsert_instrument(
     .execute(&state.db)
     .await;
 
+    // Log price history
+    let _ = sqlx::query(
+        "INSERT INTO price_history (symbol, price, ts) VALUES ($1, $2, NOW())"
+    )
+    .bind(&req.symbol)
+    .bind(req.price)
+    .execute(&state.db)
+    .await;
+
     // Rebuild portfolio with new prices
     let lots = compute_lots_from_db(&state.db).await;
     let prices = load_prices(&state.db).await;
@@ -73,6 +111,22 @@ async fn upsert_instrument(
 
 // DELETE /instruments/:symbol
 async fn delete_instrument(State(state): State<Arc<AppState>>, Path(symbol): Path<String>) -> impl IntoResponse {
+    // Prevent deletion if there are still open positions (non-zero lots) for this symbol
+    let lots = compute_lots_from_db(&state.db).await;
+    if let Some(entries) = lots.get(&symbol) {
+        let has_qty = entries.iter().any(|(q, _)| *q > f64::EPSILON);
+        if has_qty {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "cannot delete instrument with open positions",
+                    "symbol": symbol
+                })),
+            );
+        }
+    }
+
+    // Proceed with deletion if no open positions
     let res = sqlx::query("DELETE FROM instruments WHERE symbol = $1")
         .bind(&symbol)
         .execute(&state.db)
@@ -97,17 +151,18 @@ async fn delete_instrument(State(state): State<Arc<AppState>>, Path(symbol): Pat
 }
 use axum::{
     extract::{Path, State},
+    extract::Query,
     http::{header, StatusCode},
     response::{sse::Event, IntoResponse, Sse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{Utc, Duration as ChronoDuration};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
-use std::{collections::HashMap, convert::Infallible, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, convert::Infallible, sync::{Arc, Mutex}, time::Duration as StdDuration};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
 use std::env;
 use tokio::sync::broadcast::{self, Sender};
@@ -597,7 +652,7 @@ async fn stream_updates(State(state): State<Arc<AppState>>) -> Sse<impl Stream<I
 
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(StdDuration::from_secs(15))
             .text("keep-alive-text"),
     )
 }
@@ -634,6 +689,12 @@ async fn main() {
 
     let _ = sqlx::query(
         "CREATE TABLE IF NOT EXISTS instruments (\n            symbol TEXT PRIMARY KEY,\n            price DOUBLE PRECISION NOT NULL\n        )"
+    )
+    .execute(&db)
+    .await;
+
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS price_history (\n            id BIGSERIAL PRIMARY KEY,\n            symbol TEXT NOT NULL,\n            price DOUBLE PRECISION NOT NULL,\n            ts TIMESTAMPTZ NOT NULL DEFAULT NOW()\n        )"
     )
     .execute(&db)
     .await;
@@ -675,6 +736,7 @@ async fn main() {
         // Instruments
         .route("/instruments", get(get_instruments).post(upsert_instrument))
         .route("/instruments/:symbol", delete(delete_instrument))
+        .route("/instruments/:symbol/history", get(get_price_history))
         
         // Portfolio Analysis
         .route("/portfolio/analysis/risk", get(get_portfolio_risk))
