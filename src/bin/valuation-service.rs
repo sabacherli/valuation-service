@@ -1,8 +1,344 @@
-// ----- Instruments Types -----
+use axum::{
+    extract::{Path, State},
+    extract::Query,
+    http::{header, HeaderMap, StatusCode},
+    response::{sse::Event, IntoResponse, Sse, Response},
+    routing::{delete, get, post, put},
+    Json, Router,
+};
+use chrono::{Utc, Duration as ChronoDuration};
+use futures::stream::Stream;
+use futures_util::SinkExt;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
+use std::env;
+use std::{collections::HashMap, convert::Infallible, sync::{Arc, Mutex}, time::Duration as StdDuration};
+use tokio::sync::broadcast::{self, Sender};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+use tokio_tungstenite::connect_async;
+use tower_http::cors::CorsLayer;
+use tracing::{info, Level};
+use tracing_subscriber::FmtSubscriber;
+ 
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProviderConfig {
+    api_url: String,        // e.g., https://finnhub.io/api/v1
+    ws_url: String,         // e.g., wss://ws.finnhub.io
+    api_key: String,        // Finnhub API key
+    webhook_secret: String, // Secret to protect /price-stream
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct ProviderConfigPublic {
+    api_url: String,
+    ws_url: String,
+    has_api_key: bool,
+    has_webhook_secret: bool,
+    api_key_updated_at: Option<String>,
+    webhook_secret_updated_at: Option<String>,
+}
+
+async fn ensure_provider_config_table(db: &Pool<Postgres>) {
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS provider_config (\n            id INTEGER PRIMARY KEY CHECK (id = 1),\n            api_url TEXT NOT NULL,\n            ws_url TEXT NOT NULL,\n            api_key TEXT NOT NULL,\n            webhook_secret TEXT NOT NULL,\n            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n        )"
+    ).execute(db).await;
+    // Add per-secret updated timestamps if missing
+    let _ = sqlx::query("ALTER TABLE provider_config ADD COLUMN IF NOT EXISTS api_key_updated_at TIMESTAMPTZ").execute(db).await;
+    let _ = sqlx::query("ALTER TABLE provider_config ADD COLUMN IF NOT EXISTS webhook_secret_updated_at TIMESTAMPTZ").execute(db).await;
+    // Backfill from updated_at when secrets are present but per-secret timestamps are NULL
+    let _ = sqlx::query("UPDATE provider_config SET api_key_updated_at = COALESCE(api_key_updated_at, updated_at) WHERE api_key_updated_at IS NULL AND api_key <> ''").execute(db).await;
+    let _ = sqlx::query("UPDATE provider_config SET webhook_secret_updated_at = COALESCE(webhook_secret_updated_at, updated_at) WHERE webhook_secret_updated_at IS NULL AND webhook_secret <> ''").execute(db).await;
+}
+
+async fn load_provider_config(db: &Pool<Postgres>) -> ProviderConfig {
+    if let Ok(row) = sqlx::query("SELECT api_url, ws_url, api_key, webhook_secret FROM provider_config WHERE id = 1")
+        .fetch_one(db)
+        .await
+    {
+        let api_url: String = row.get("api_url");
+        let ws_url: String = row.get("ws_url");
+        let api_key: String = row.get("api_key");
+        let webhook_secret: String = row.get("webhook_secret");
+        return ProviderConfig { api_url, ws_url, api_key, webhook_secret };
+    }
+    // Defaults from env for bootstrap
+    let api_key = env::var("FINNHUB_API_KEY").unwrap_or_default();
+    let webhook_secret = env::var("WEBHOOK_SECRET").unwrap_or_default();
+    let cfg = ProviderConfig {
+        api_url: "https://finnhub.io/api/v1".to_string(),
+        ws_url: "wss://ws.finnhub.io".to_string(),
+        api_key,
+        webhook_secret,
+    };
+    let _ = sqlx::query("INSERT INTO provider_config (id, api_url, ws_url, api_key, webhook_secret) VALUES (1, $1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET api_url = EXCLUDED.api_url, ws_url = EXCLUDED.ws_url, api_key = EXCLUDED.api_key, webhook_secret = EXCLUDED.webhook_secret, updated_at = NOW()")
+        .bind(&cfg.api_url)
+        .bind(&cfg.ws_url)
+        .bind(&cfg.api_key)
+        .bind(&cfg.webhook_secret)
+        .execute(db)
+        .await;
+    cfg
+}
+
+// Admin endpoints are always open; no admin-secret enforcement
+
+ 
+
 #[derive(Debug, Deserialize)]
-struct InstrumentUpsertRequest {
-    symbol: String,
-    price: f64,
+struct ProviderConfigUpdate {
+    api_key: Option<String>,
+    webhook_secret: Option<String>,
+}
+
+// GET /admin/provider-config
+async fn get_provider_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.provider_config.read().await.clone();
+    // Read timestamps directly from DB to avoid widening in-memory struct
+    let row = sqlx::query("SELECT COALESCE(api_key_updated_at, updated_at) AS api_key_updated_at, COALESCE(webhook_secret_updated_at, updated_at) AS webhook_secret_updated_at FROM provider_config WHERE id = 1")
+        .fetch_one(&state.db)
+        .await;
+    let (api_key_updated_at, webhook_secret_updated_at) = match row {
+        Ok(r) => {
+            let a: Option<chrono::DateTime<chrono::Utc>> = r.try_get("api_key_updated_at").ok();
+            let b: Option<chrono::DateTime<chrono::Utc>> = r.try_get("webhook_secret_updated_at").ok();
+            (a.map(|t| t.to_rfc3339()), b.map(|t| t.to_rfc3339()))
+        }
+        Err(_) => (None, None),
+    };
+    let public = ProviderConfigPublic {
+        api_url: cfg.api_url,
+        ws_url: cfg.ws_url,
+        has_api_key: !cfg.api_key.is_empty(),
+        has_webhook_secret: !cfg.webhook_secret.is_empty(),
+        api_key_updated_at,
+        webhook_secret_updated_at,
+    };
+    (StatusCode::OK, Json(public)).into_response()
+}
+
+// PUT /admin/provider-config
+async fn update_provider_config(State(state): State<Arc<AppState>>, Json(payload): Json<ProviderConfigUpdate>) -> impl IntoResponse {
+    let mut cfg = state.provider_config.read().await.clone();
+    // Update API key if provided
+    if let Some(v) = payload.api_key {
+        cfg.api_key = v.trim().to_string();
+        let _ = sqlx::query("UPDATE provider_config SET api_key = $1, api_key_updated_at = NOW(), updated_at = NOW() WHERE id = 1")
+            .bind(&cfg.api_key)
+            .execute(&state.db)
+            .await;
+    }
+    // Update webhook secret if provided
+    if let Some(v) = payload.webhook_secret {
+        cfg.webhook_secret = v.trim().to_string();
+        let _ = sqlx::query("UPDATE provider_config SET webhook_secret = $1, webhook_secret_updated_at = NOW(), updated_at = NOW() WHERE id = 1")
+            .bind(&cfg.webhook_secret)
+            .execute(&state.db)
+            .await;
+    }
+    {
+        let mut w = state.provider_config.write().await;
+        *w = cfg.clone();
+    }
+    (StatusCode::OK, Json(json!({"status":"updated"}))).into_response()
+}
+
+async fn current_api_key(state: &AppState) -> String {
+    let key = state.provider_config.read().await.api_key.clone();
+    if !key.is_empty() { key } else { env::var("FINNHUB_API_KEY").unwrap_or_default() }
+}
+
+async fn current_webhook_secret(state: &AppState) -> String {
+    let s = state.provider_config.read().await.webhook_secret.clone();
+    if !s.is_empty() { s } else { env::var("WEBHOOK_SECRET").unwrap_or_default() }
+}
+async fn current_api_base(state: &AppState) -> String {
+    let base = state.provider_config.read().await.api_url.clone();
+    if !base.is_empty() { base } else { "https://finnhub.io/api/v1".to_string() }
+}
+async fn current_ws_base(state: &AppState) -> String {
+    let base = state.provider_config.read().await.ws_url.clone();
+    if !base.is_empty() { base } else { "wss://ws.finnhub.io".to_string() }
+}
+// (Removed old manual instrument upsert types)
+
+// ----- Price stream SSE proxy to Finnhub -----
+#[derive(Debug, Deserialize)]
+struct PriceStreamQuery { symbols: Option<String>, secret: Option<String> }
+
+#[derive(Debug, Deserialize)]
+struct SymbolSearchQuery { q: String, exchange: Option<String> }
+
+// GET /symbols/search?q=apple[&exchange=US] -> search symbols via Finnhub
+async fn search_symbols(State(state): State<Arc<AppState>>, Query(params): Query<SymbolSearchQuery>) -> impl IntoResponse {
+    let api_key = current_api_key(&state).await;
+    if api_key.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"FINNHUB_API_KEY not configured"}))).into_response();
+    }
+    let q = params.q.trim();
+    if q.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"missing q"}))).into_response();
+    }
+    let exchange = params.exchange.as_deref().unwrap_or("US");
+    let client = reqwest::Client::new();
+    let base = current_api_base(&state).await;
+    match client
+        .get(format!("{}/search", base.trim_end_matches('/')))
+        .query(&[("q", q), ("exchange", exchange), ("token", api_key.as_str())])
+        .send()
+        .await {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error":"finnhub search failed"}))).into_response();
+            }
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let list = v.get("result").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+                    let items: Vec<SymbolItem> = list
+                        .into_iter()
+                        .filter_map(|it| {
+                            let symbol = it.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            if symbol.is_empty() { return None; }
+                            let description = it.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+                            Some(SymbolItem { symbol, description })
+                        })
+                        .collect();
+                    Json(items).into_response()
+                }
+                Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error":"invalid response"}))).into_response(),
+            }
+        }
+        Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error":"request failed"}))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeRequest { symbol: String }
+
+// POST /instruments/subscribe { symbol }
+async fn subscribe_instrument(State(state): State<Arc<AppState>>, Json(req): Json<SubscribeRequest>) -> impl IntoResponse {
+    let api_key = current_api_key(&state).await;
+    if api_key.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"FINNHUB_API_KEY not configured"}))).into_response(); }
+
+    let symbol = req.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"symbol required"}))).into_response();
+    }
+
+    // Ensure instrument exists with a placeholder price
+    let _ = sqlx::query("INSERT INTO instruments (symbol, price) VALUES ($1, $2) ON CONFLICT (symbol) DO NOTHING")
+        .bind(&symbol)
+        .bind(0.0f64)
+        .execute(&state.db)
+        .await;
+
+    // No historical backfill: rely on live ticks to populate price_history and update current prices
+
+    // Recompute and broadcast portfolio (prices may affect positions)
+    let lots = compute_lots_from_db(&state.db).await;
+    let prices = load_prices(&state.db).await;
+    if let Ok(mut portfolio) = state.portfolio.lock() {
+        let updated = build_portfolio_update_from_lots(&lots, &prices);
+        *portfolio = updated.clone();
+        let _ = state.tx.send(updated);
+    }
+
+    (StatusCode::CREATED, Json(json!({"status":"subscribed", "symbol": symbol }))).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct TickOut { symbol: String, price: f64, ts: String }
+
+#[derive(Debug, Deserialize)]
+struct FinnhubTrade { p: f64, s: String, #[allow(dead_code)] t: Option<i64> }
+
+#[derive(Debug, Deserialize)]
+struct FinnhubMsg { #[serde(default)] r#type: String, #[serde(default)] data: Vec<FinnhubTrade> }
+
+// GET /price-stream?symbols=AAPL,MSFT
+async fn price_stream(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<PriceStreamQuery>) -> impl IntoResponse {
+    // Optional header auth
+    let expected = current_webhook_secret(&state).await;
+    if !expected.is_empty() {
+        let provided_header = headers
+            .get("x-webhook-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let provided_query = q.secret.as_deref().unwrap_or("");
+        if provided_header != expected && provided_query != expected { return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(); }
+    }
+
+    let api_key = current_api_key(&state).await;
+    if api_key.is_empty() { return (StatusCode::SERVICE_UNAVAILABLE, "FINNHUB_API_KEY not configured").into_response(); }
+
+    let symbols: Vec<String> = q
+        .symbols
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| { let t = s.trim(); if t.is_empty() { None } else { Some(t.to_string()) } })
+        .collect();
+
+    let db = state.db.clone();
+    let stream = async_stream::stream! {
+        // Connect to Finnhub WS
+        let ws_base = current_ws_base(&state).await;
+        let url = format!("{}?token={}", ws_base.trim_end_matches('/'), api_key);
+        if let Ok((mut ws, _)) = connect_async(&url).await {
+            // Subscribe symbols
+            for s in &symbols {
+                let msg = format!("{{\"type\":\"subscribe\",\"symbol\":\"{}\"}}", s);
+                let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(msg)).await;
+            }
+
+            // Initial ack to client
+            if let Ok(init) = serde_json::to_string(&json!({"status":"subscribed","symbols": symbols})) {
+                let _ = yield Ok::<Event, Infallible>(Event::default().data(init));
+            }
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
+                        if let Ok(parsed) = serde_json::from_str::<FinnhubMsg>(&txt) {
+                            if parsed.r#type == "trade" {
+                                for t in parsed.data {
+                                    let out = TickOut { symbol: t.s, price: t.p, ts: Utc::now().to_rfc3339() };
+                                    // Persist tick
+                                    let _ = sqlx::query("INSERT INTO price_history (symbol, price, ts) VALUES ($1, $2, NOW())")
+                                        .bind(&out.symbol)
+                                        .bind(out.price)
+                                        .execute(&db)
+                                        .await;
+                                    let _ = sqlx::query("INSERT INTO instruments (symbol, price) VALUES ($1, $2) ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price")
+                                        .bind(&out.symbol)
+                                        .bind(out.price)
+                                        .execute(&db)
+                                        .await;
+                                    if let Ok(data) = serde_json::to_string(&out) {
+                                        let _ = yield Ok::<Event, Infallible>(Event::default().data(data));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => { break; }
+                    Ok(_) => {}
+                    Err(_) => { break; }
+                }
+            }
+        } else {
+            if let Ok(err) = serde_json::to_string(&json!({"error":"failed_to_connect_ws"})) {
+                let _ = yield Ok::<Event, Infallible>(Event::default().data(err));
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(StdDuration::from_secs(15))
+            .text("keep-alive-text"),
+    ).into_response()
 }
 
 // ---- Price History ----
@@ -75,39 +411,36 @@ async fn get_instruments(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-// POST /instruments (create or update price)
-async fn upsert_instrument(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<InstrumentUpsertRequest>,
-) -> impl IntoResponse {
-    let _ = sqlx::query(
-        "INSERT INTO instruments (symbol, price) VALUES ($1, $2)
-         ON CONFLICT (symbol) DO UPDATE SET price = EXCLUDED.price",
-    )
-    .bind(&req.symbol)
-    .bind(req.price)
-    .execute(&state.db)
-    .await;
+// Finnhub symbol item
+#[derive(Debug, Deserialize, Serialize)]
+struct SymbolItem { symbol: String, description: Option<String> }
 
-    // Log price history
-    let _ = sqlx::query(
-        "INSERT INTO price_history (symbol, price, ts) VALUES ($1, $2, NOW())"
-    )
-    .bind(&req.symbol)
-    .bind(req.price)
-    .execute(&state.db)
-    .await;
-
-    // Rebuild portfolio with new prices
-    let lots = compute_lots_from_db(&state.db).await;
-    let prices = load_prices(&state.db).await;
-    if let Ok(mut portfolio) = state.portfolio.lock() {
-        let updated = build_portfolio_update_from_lots(&lots, &prices);
-        *portfolio = updated.clone();
-        let _ = state.tx.send(updated);
+// GET /symbols -> list of symbols from Finnhub (US exchange by default)
+async fn get_symbols(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let api_key = current_api_key(&state).await;
+    if api_key.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"FINNHUB_API_KEY not configured"}))).into_response();
     }
-    (StatusCode::CREATED, Json(serde_json::json!({"symbol": req.symbol, "price": req.price})))
+    let base = current_api_base(&state).await;
+    let url = format!("{}/stock/symbol?exchange=US&token={}", base.trim_end_matches('/'), api_key);
+    let client = reqwest::Client::new();
+    match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
+            Ok(list) => {
+                let items: Vec<SymbolItem> = list.into_iter().filter_map(|v| {
+                    let symbol = v.get("symbol").and_then(|s| s.as_str())?.to_string();
+                    let description = v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+                    Some(SymbolItem { symbol, description })
+                }).collect();
+                (StatusCode::OK, Json(items)).into_response()
+            }
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("parse error: {}", e)}))).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("request failed: {}", e)}))).into_response(),
+    }
 }
+
+// Removed: backfill_price_history endpoint and related types
 
 // DELETE /instruments/:symbol
 async fn delete_instrument(State(state): State<Arc<AppState>>, Path(symbol): Path<String>) -> impl IntoResponse {
@@ -149,28 +482,7 @@ async fn delete_instrument(State(state): State<Arc<AppState>>, Path(symbol): Pat
         ),
     }
 }
-use axum::{
-    extract::{Path, State},
-    extract::Query,
-    http::{header, StatusCode},
-    response::{sse::Event, IntoResponse, Sse, Response},
-    routing::{delete, get, post, put},
-    Json, Router,
-};
-use chrono::{Utc, Duration as ChronoDuration};
-use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
-use std::{collections::HashMap, convert::Infallible, sync::{Arc, Mutex}, time::Duration as StdDuration};
-use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
-use std::env;
-use tokio::sync::broadcast::{self, Sender};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
-use tower_http::cors::CorsLayer;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
 
 // Application state
 #[derive(Clone)]
@@ -180,6 +492,8 @@ struct AppState {
     portfolio: Arc<Mutex<PortfolioUpdate>>, 
     // Database pool for persistence
     db: Pool<Postgres>,
+    // Provider configuration (persisted, hot-reloadable)
+    provider_config: Arc<tokio::sync::RwLock<ProviderConfig>>, 
 }
 
 // Utilities to rebuild individual lots (positions) from transaction history
@@ -394,12 +708,7 @@ struct Transaction {
     timestamp: String,
 }
 
-// Request for updating a stock price
-#[derive(Debug, Deserialize)]
-struct UpdatePriceRequest {
-    symbol: String,
-    price: f64,
-}
+// (Removed old manual update-price types)
 
 #[derive(Debug, Deserialize)]
 struct AddPositionRequest {
@@ -598,35 +907,7 @@ async fn get_portfolio(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     Json(body)
 }
 
-// Handler for POST /update-price
-async fn update_price(
-    state: State<Arc<AppState>>,
-    Json(update_req): Json<UpdatePriceRequest>,
-) -> impl IntoResponse {
-    info!("Updating price for {} to {}", update_req.symbol, update_req.price);
-    
-    // Update price in the in-memory portfolio if symbol exists
-    if let Ok(mut portfolio) = state.portfolio.lock() {
-        for pos in &mut portfolio.positions {
-            if pos.symbol == update_req.symbol {
-                pos.price = update_req.price;
-                pos.value = pos.quantity * pos.price;
-                pos.pnl = (pos.price - pos.average_cost) * pos.quantity;
-                pos.pnl_percent = if pos.average_cost > 0.0 { (pos.price - pos.average_cost) / pos.average_cost * 100.0 } else { 0.0 };
-            }
-        }
-        portfolio.timestamp = Utc::now().to_rfc3339();
-        recalc_portfolio_value(&mut portfolio);
-        let _ = state.tx.send(portfolio.clone());
-    }
-    
-    (StatusCode::OK, Json(json!({
-        "status": "price_updated",
-        "symbol": update_req.symbol,
-        "new_price": update_req.price,
-        "timestamp": Utc::now().to_rfc3339()
-    })))
-}
+// (Removed old manual update-price handler)
 
 // Handler for GET /stream
 async fn stream_updates(State(state): State<Arc<AppState>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -699,6 +980,9 @@ async fn main() {
     .execute(&db)
     .await;
 
+    // Ensure provider config table exists and load config
+    ensure_provider_config_table(&db).await;
+
     // Build initial in-memory portfolio from persisted transactions (as individual lots)
     let lots = compute_lots_from_db(&db).await;
     let prices = load_prices(&db).await;
@@ -707,13 +991,14 @@ async fn main() {
     let state = Arc::new(AppState {
         tx,
         portfolio: Arc::new(Mutex::new(initial_from_db)),
-        db,
+        db: db.clone(),
+        provider_config: Arc::new(tokio::sync::RwLock::new(load_provider_config(&db).await)),
     });
 
     // Set up CORS
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([header::CONTENT_TYPE, header::HeaderName::from_static("x-webhook-secret")])
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -733,20 +1018,29 @@ async fn main() {
         .route("/portfolio/positions/:position_id", put(update_position).delete(delete_position))
         // Transactions
         .route("/transactions", get(get_transactions).post(add_transaction).delete(clear_transactions))
-        // Instruments
-        .route("/instruments", get(get_instruments).post(upsert_instrument))
+        // Instruments (read-only history; manual updates removed)
+        .route("/instruments", get(get_instruments))
+        .route("/instruments/subscribe", post(subscribe_instrument))
         .route("/instruments/:symbol", delete(delete_instrument))
         .route("/instruments/:symbol/history", get(get_price_history))
+        // Symbols universe and backfill
+        .route("/symbols", get(get_symbols))
+        .route("/symbols/search", get(search_symbols))
+        // Backfill route removed
+        
+        // Admin configuration
+        .route("/admin/provider-config", get(get_provider_config).put(update_provider_config))
         
         // Portfolio Analysis
         .route("/portfolio/analysis/risk", get(get_portfolio_risk))
         .route("/portfolio/analysis/performance", get(get_portfolio_performance))
         
-        // Market Data
-        .route("/update-price", post(update_price))
+        // Market Data: manual update removed
         
         // Real-time Updates
         .route("/stream", get(stream_updates))
+        // Price streaming proxy to Finnhub
+        .route("/price-stream", get(price_stream))
         
         .with_state(state)
         .layer(cors);
